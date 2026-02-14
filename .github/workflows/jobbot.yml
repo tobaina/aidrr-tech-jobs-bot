@@ -1,1 +1,38 @@
+name: Aidrr Tech Jobs Bot
 
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *" # every 6 hours (UTC)
+
+jobs:
+  post_jobs:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install requests
+
+      - name: Run job bot
+        env:
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python jobbot.py
+
+      - name: Save state (dedupe)
+        run: |
+          git config user.name "aidrr-bot"
+          git config user.email "aidrr-bot@users.noreply.github.com"
+          git add state.json || true
+          git commit -m "Update state" || echo "No changes"
+          git push || echo "No push"
