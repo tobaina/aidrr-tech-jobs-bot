@@ -3,7 +3,7 @@ name: Aidrr Tech Jobs Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *" # every 6 hours (UTC)
+    - cron: "0 */6 * * *"  # every 6 hours (UTC)
 
 jobs:
   post_jobs:
@@ -25,14 +25,5 @@ jobs:
       - name: Run job bot
         env:
           RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: |
-          python jobbot.py
-
-      - name: Save state (dedupe)
-        run: |
-          git config user.name "aidrr-bot"
-          git config user.email "aidrr-bot@users.noreply.github.com"
-          git add state.json || true
-          git commit -m "Update state" || echo "No changes"
-          git push || echo "No push"
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: python jobbot.py
