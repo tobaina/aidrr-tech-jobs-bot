@@ -2,18 +2,17 @@ import os
 import time
 import json
 import requests
-from typing import Dict, List, Any, Tuple, Set
+from typing import Dict, List, Any, Tuple, Set, Optional
+from urllib.parse import quote_plus
 
 # ----------------------------
 # ENV (GitHub Secrets)
 # ----------------------------
 RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "").strip()
 
-# accept either secret name so you never get stuck again
 SLACK_WEBHOOK_URL = (
     os.environ.get("SLACK_WEBHOOK_URL", "").strip()
     or os.environ.get("SLACK_WEBHOOK", "").strip()
-    or os.environ.get("SLACK_WEBHOOK_URL".lower(), "").strip()
 )
 
 if not RAPIDAPI_KEY:
@@ -31,49 +30,37 @@ HEADERS = {
 }
 
 # ----------------------------
-# Canada targeting helpers
+# Canada strict detection (STRUCTURED FIELDS ONLY)
 # ----------------------------
-CANADA_PROVINCE_HINTS = [
-    "ON", "Ontario",
-    "BC", "British Columbia",
-    "AB", "Alberta",
-    "QC", "Quebec", "Québec",
-    "NS", "Nova Scotia",
-    "NB", "New Brunswick",
-    "MB", "Manitoba",
-    "SK", "Saskatchewan",
-    "NL", "Newfoundland", "Labrador",
-    "PE", "Prince Edward Island",
-    "NT", "Northwest Territories",
-    "NU", "Nunavut",
-    "YT", "Yukon",
-]
+CANADA_PROVINCE_CODES = {
+    "ON", "BC", "AB", "QC", "NS", "NB", "MB", "SK", "NL", "PE", "NT", "NU", "YT"
+}
 
-CANADA_CITY_HINTS = [
-    "Toronto", "Vancouver", "Calgary", "Ottawa", "Montreal", "Montréal",
-    "Edmonton", "Waterloo", "Kitchener", "Cambridge", "Mississauga",
-    "Winnipeg", "Halifax", "Victoria", "Quebec City", "Québec",
-    "Brampton", "Hamilton", "London", "Markham", "Burnaby", "Surrey",
-]
+# City hints only used against job_city (not title)
+CANADA_MAJOR_CITIES = {
+    "toronto", "vancouver", "calgary", "ottawa", "montreal", "montréal",
+    "edmonton", "waterloo", "kitchener", "cambridge", "mississauga",
+    "winnipeg", "halifax", "victoria", "brampton", "hamilton", "london",
+    "markham", "burnaby", "surrey", "quebec", "québec"
+}
 
-# We will search these as "location anchors" to get real Canadian results
+# Search anchors (to find Canada jobs)
 CANADA_LOCATION_QUERIES = [
     "Remote Canada",
     "Toronto, ON", "Waterloo, ON", "Ottawa, ON", "Mississauga, ON",
     "Vancouver, BC", "Calgary, AB", "Edmonton, AB",
     "Montreal, QC", "Halifax, NS", "Winnipeg, MB",
-    "Canada",  # fallback
+    "Canada",
 ]
 
 # ----------------------------
-# TECH ROLE GROUPS (your “all tech roles”)
-# Keep it broad but not insane to avoid rate limits
+# TECH ROLE GROUPS
 # ----------------------------
 ROLE_GROUPS: List[Tuple[str, str]] = [
     ("Software Engineering",
      '"software engineer" OR "software developer" OR "senior software engineer" OR "full stack developer" OR "backend developer" OR "frontend developer" OR "mobile developer" OR "ios developer" OR "android developer"'),
     ("DevOps / Cloud / SRE",
-     '"devops engineer" OR "site reliability engineer" OR "sre" OR "cloud engineer" OR "cloud architect" OR "platform engineer" OR kubernetes OR terraform OR "cloud administrator"'),
+     '"devops engineer" OR "site reliability engineer" OR "sre" OR "cloud engineer" OR "cloud architect" OR "platform engineer" OR kubernetes OR terraform'),
     ("Data / Analytics / ML",
      '"data analyst" OR "business intelligence" OR "bi analyst" OR "analytics engineer" OR "data engineer" OR "machine learning engineer" OR "ml engineer"'),
     ("Cybersecurity",
@@ -91,177 +78,191 @@ ROLE_GROUPS: List[Tuple[str, str]] = [
 # ----------------------------
 # Posting control
 # ----------------------------
-MAX_JOBS_TO_POST = 25              # keep Slack readable
-DATE_POSTED = "week"               # today/3days/week/month
-REMOTE_ONLY = False                # set True if you only want remote jobs
-NUM_PAGES_PER_SEARCH = 1           # keep low to avoid 429
-SLEEP_BETWEEN_CALLS_SEC = 1.25     # gentle throttling
-
-# Dedup store
+MAX_JOBS_TO_POST = 25
+DATE_POSTED = "month"          # week is often too tight for CA; month returns more
+REMOTE_ONLY = False
+NUM_PAGES_PER_SEARCH = 1
+SLEEP_BETWEEN_CALLS_SEC = 1.25
 SEEN_FILE = "seen_jobs.json"
 
+# Prefer better links
+MIN_QUALITY_SCORE = 0.70       # reduce junk
+REQUIRE_DIRECT_APPLY = False   # set True if you want only job_apply_is_direct == True
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def safe_str(x: Any) -> str:
+    return (x or "").strip()
 
 def load_seen() -> Set[str]:
     try:
         with open(SEEN_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, list):
-                return set(data)
-            return set()
+            return set(data) if isinstance(data, list) else set()
     except Exception:
         return set()
-
 
 def save_seen(seen: Set[str]) -> None:
     try:
         with open(SEEN_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(list(seen))[:5000], f)  # cap file size
+            json.dump(sorted(list(seen))[:5000], f)
     except Exception:
         pass
 
-
 def slack_post(text: str) -> None:
-    payload = {"text": text}
-    r = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=20)
+    r = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=20)
     r.raise_for_status()
 
-
-def safe_str(x: Any) -> str:
-    return (x or "").strip()
-
-
-def looks_like_canada(job: Dict[str, Any]) -> bool:
-    """
-    Strict Canada detection with fallbacks.
-    """
-    country = safe_str(job.get("job_country")).upper()
-    if country == "CA":
-        return True
-
-    # Build one combined location string
-    city = safe_str(job.get("job_city"))
-    state = safe_str(job.get("job_state"))
-    loc = f"{city} {state}".strip()
-
-    title = safe_str(job.get("job_title"))
-    desc = safe_str(job.get("job_description"))
-    combined = f"{loc} {title} {desc}".lower()
-
-    # If explicitly remote and mentions Canada clearly
-    if job.get("job_is_remote") is True:
-        if "remote canada" in combined or "canada (remote)" in combined or "remote (canada)" in combined:
-            return True
-        # Some postings say "Canada" in text for remote roles
-        if "canada" in combined and any(h.lower() in combined for h in ["toronto", "vancouver", "montreal", "calgary", "ottawa", "ontario", "british columbia", "alberta", "quebec"]):
-            return True
-
-    # Province hints
-    for hint in CANADA_PROVINCE_HINTS:
-        if hint.lower() in combined:
-            return True
-
-    # City hints
-    for hint in CANADA_CITY_HINTS:
-        if hint.lower() in combined:
-            return True
-
-    return False
-
-
-def build_search_queries() -> List[Tuple[str, str, str]]:
-    """
-    Returns list of (group_name, location_anchor, query_string)
-    """
-    items = []
+def build_queries() -> List[Tuple[str, str]]:
+    queries: List[Tuple[str, str]] = []
     for group_name, role_query in ROLE_GROUPS:
         for loc in CANADA_LOCATION_QUERIES:
-            # This format forces Canadian locality better than just "in Canada"
-            q = f"({role_query}) {loc}"
-            items.append((group_name, loc, q))
-    return items
+            queries.append((group_name, f"({role_query}) {loc}"))
+    return queries
 
-
-def rapidapi_search(query: str, page: int = 1) -> Dict[str, Any]:
+def rapidapi_search(query: str) -> Dict[str, Any]:
     params = {
         "query": query,
-        "page": page,
-        "num_pages": 1,
+        "page": 1,
+        "num_pages": NUM_PAGES_PER_SEARCH,
         "date_posted": DATE_POSTED,
         "remote_jobs_only": REMOTE_ONLY,
     }
-    # Retry on 429
+
     max_tries = 5
     backoff = 2.0
 
-    for attempt in range(1, max_tries + 1):
+    for _ in range(max_tries):
         r = requests.get(API_URL, headers=HEADERS, params=params, timeout=30)
         if r.status_code == 429:
-            # rate limited: wait and retry
             time.sleep(backoff)
             backoff *= 1.8
             continue
-        # Other errors: raise
         r.raise_for_status()
         return r.json()
 
-    # Still 429 after retries
     return {"status": "RATE_LIMITED", "data": []}
 
+def is_canada_job(job: Dict[str, Any]) -> bool:
+    """
+    FINAL strict rule:
+    - Accept only if structured fields indicate Canada.
+    - We DO NOT look at job_title for Canada hints (because query text gets echoed into titles).
+    """
+    country = safe_str(job.get("job_country")).upper()
+    state = safe_str(job.get("job_state")).upper()
+    city = safe_str(job.get("job_city")).lower()
+
+    if country == "CA":
+        return True
+
+    # Some results omit country but have province code
+    if state in CANADA_PROVINCE_CODES:
+        return True
+
+    # City-only hint (only if city itself is clearly Canadian)
+    if city in CANADA_MAJOR_CITIES:
+        return True
+
+    # Remote roles: require country == CA (do not guess)
+    if job.get("job_is_remote") is True and country == "CA":
+        return True
+
+    return False
+
+def quality_ok(job: Dict[str, Any]) -> bool:
+    score_str = safe_str(job.get("job_apply_quality_score"))
+    try:
+        score = float(score_str) if score_str else 0.0
+    except Exception:
+        score = 0.0
+
+    if score and score < MIN_QUALITY_SCORE:
+        return False
+
+    if REQUIRE_DIRECT_APPLY and job.get("job_apply_is_direct") is not True:
+        return False
+
+    return True
+
+def make_google_link(title: str, company: str, city: str, state: str) -> str:
+    q = f'{title} {company} {city} {state} Canada'
+    return "https://www.google.com/search?q=" + quote_plus(q)
+
+def link_is_alive(url: str) -> bool:
+    """
+    Quick, low-cost validation.
+    If it fails, we will post a Google link instead.
+    """
+    if not url.startswith("http"):
+        return False
+
+    try:
+        # HEAD first
+        r = requests.head(url, timeout=10, allow_redirects=True)
+        if 200 <= r.status_code < 400:
+            return True
+        # Fallback GET (some sites block HEAD)
+        r = requests.get(url, timeout=10, allow_redirects=True)
+        return 200 <= r.status_code < 400
+    except Exception:
+        return False
+
+def pick_best_link(job: Dict[str, Any]) -> str:
+    title = safe_str(job.get("job_job_title")) or safe_str(job.get("job_title")) or "Job"
+    company = safe_str(job.get("employer_name")) or "Company"
+    city = safe_str(job.get("job_city"))
+    state = safe_str(job.get("job_state"))
+
+    apply_link = safe_str(job.get("job_apply_link"))
+    google_link = safe_str(job.get("job_google_link")) or make_google_link(title, company, city, state)
+
+    # Validate apply link. If dead, use Google link (more stable).
+    if apply_link and link_is_alive(apply_link):
+        return apply_link
+    return google_link
 
 def format_job(job: Dict[str, Any], group_name: str) -> str:
-    title = safe_str(job.get("job_title")) or safe_str(job.get("job_job_title")) or "Job"
+    title = safe_str(job.get("job_job_title")) or safe_str(job.get("job_title")) or "Job"
     company = safe_str(job.get("employer_name")) or "Company"
     city = safe_str(job.get("job_city"))
     state = safe_str(job.get("job_state"))
     country = safe_str(job.get("job_country"))
     is_remote = job.get("job_is_remote")
-    publisher = safe_str(job.get("job_publisher"))
-    link = safe_str(job.get("job_apply_link")) or safe_str(job.get("job_google_link"))
+    publisher = safe_str(job.get("job_publisher")) or "Source"
+    link = pick_best_link(job)
 
-    loc_bits = []
-    if city:
-        loc_bits.append(city)
-    if state:
-        loc_bits.append(state)
-    if country:
-        loc_bits.append(country)
+    loc_bits = [b for b in [city, state, country] if b]
     loc = ", ".join(loc_bits) if loc_bits else "Location not listed"
-
     remote_tag = "Remote" if is_remote else "On-site/Hybrid"
-    pub = publisher if publisher else "Source"
 
     return (
         f"*{group_name}*\n"
         f"{title} | {company}\n"
-        f"{loc} • {remote_tag} • {pub}\n"
+        f"{loc} • {remote_tag} • {publisher}\n"
         f"{link}\n"
     )
-
 
 def main():
     seen = load_seen()
     posted: List[str] = []
-    rate_limited_count = 0
-    searches_run = 0
+    rate_limited = 0
+    searches = 0
 
-    queries = build_search_queries()
-
-    for group_name, loc_anchor, q in queries:
+    for group_name, q in build_queries():
         if len(posted) >= MAX_JOBS_TO_POST:
             break
 
         time.sleep(SLEEP_BETWEEN_CALLS_SEC)
-        searches_run += 1
+        searches += 1
 
-        data = rapidapi_search(q, page=1)
+        data = rapidapi_search(q)
         if data.get("status") == "RATE_LIMITED":
-            rate_limited_count += 1
+            rate_limited += 1
             continue
 
         jobs = data.get("data") or []
-        if not jobs:
-            continue
-
         for job in jobs:
             if len(posted) >= MAX_JOBS_TO_POST:
                 break
@@ -270,41 +271,43 @@ def main():
             if not job_id or job_id in seen:
                 continue
 
-            # Strict Canada filter (but smarter than "in Canada" keyword)
-            if not looks_like_canada(job):
+            # Hard Canada filter (structured fields only)
+            if not is_canada_job(job):
                 continue
 
-            # Passed
-            msg = format_job(job, group_name)
-            posted.append(msg)
+            # Quality filter
+            if not quality_ok(job):
+                continue
+
+            posted.append(format_job(job, group_name))
             seen.add(job_id)
 
     save_seen(seen)
 
-    # Slack output (clean + no scary errors)
+    # Slack output (clean)
     if posted:
         header = f"✅ Aidrr Tech Jobs Bot: Posted {len(posted)} Canada jobs."
-        if rate_limited_count:
-            header += f" (Rate-limited on {rate_limited_count} searches; continued.)"
+        if rate_limited:
+            header += f" (Rate-limited on {rate_limited} searches; continued.)"
         slack_post(header)
-        # post jobs in chunks so Slack does not reject large payload
-        chunk = []
-        char_count = 0
-        for line in posted:
-            if char_count + len(line) > 3300:
+
+        # Chunk posts to avoid Slack payload limits
+        chunk: List[str] = []
+        size = 0
+        for item in posted:
+            if size + len(item) > 3300:
                 slack_post("\n".join(chunk))
                 chunk = []
-                char_count = 0
-            chunk.append(line)
-            char_count += len(line)
+                size = 0
+            chunk.append(item)
+            size += len(item)
         if chunk:
             slack_post("\n".join(chunk))
     else:
         msg = "No Canada tech jobs found in this run."
-        if rate_limited_count:
+        if rate_limited:
             msg = "No Canada tech jobs found in this run (or API rate-limited this run)."
         slack_post(msg)
-
 
 if __name__ == "__main__":
     main()
