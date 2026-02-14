@@ -3,7 +3,7 @@ name: Aidrr Tech Jobs Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */12 * * *" # every 12 hours (UTC) to reduce rate limit issues
+    - cron: "0 */12 * * *" # every 12 hours (UTC)
 
 jobs:
   post_jobs:
@@ -20,11 +20,13 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install requests
 
       - name: Run job bot
         env:
           RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: python jobbot.py
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          python jobbot.py
