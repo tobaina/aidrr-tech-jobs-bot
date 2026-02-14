@@ -25,8 +25,8 @@ jobs:
       - name: Run job bot
         env:
           RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          # We pass BOTH so it works no matter which secret name you keep
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-          DATE_POSTED: "week"
-          PAGES_PER_QUERY: "2"
-        run: python jobbot.py
+        run: |
+          python jobbot.py
