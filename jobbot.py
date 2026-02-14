@@ -1,77 +1,152 @@
 import os
+import json
+import hashlib
+from datetime import datetime, timezone
+
 import requests
 
-# --------- ENV (GitHub Secrets) ---------
-RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "").strip()
-SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+# ----------------------------
+# ENV (GitHub Secrets)
+# ----------------------------
+RAPIDAPI_KEY = (os.environ.get("RAPIDAPI_KEY") or "").strip()
+SLACK_WEBHOOK_URL = (os.environ.get("SLACK_WEBHOOK_URL") or "").strip()
 
 if not RAPIDAPI_KEY:
     raise RuntimeError("Missing RAPIDAPI_KEY secret in GitHub Actions.")
 if not SLACK_WEBHOOK_URL:
     raise RuntimeError("Missing SLACK_WEBHOOK_URL secret in GitHub Actions.")
 
-# --------- RapidAPI JSearch Endpoint ---------
-url = "https://jsearch.p.rapidapi.com/search"
+# ----------------------------
+# SETTINGS
+# ----------------------------
+STATE_FILE = "state.json"          # stores dedupe hashes
+MAX_POSTS_PER_RUN = 15             # how many jobs to post each run
+NUM_PAGES = 2                      # how many pages to fetch from API (increase if you want more)
+DATE_POSTED = "7days"              # last 7 days
+COUNTRY = "ca"                     # Canada
 
-# ✅ Canada jobs (NOT remote only)
-querystring = {
-    "query": "software engineer OR data analyst OR cybersecurity OR cloud engineer OR devops",
-    "page": "1",
-    "num_pages": "1",
-    "country": "ca",              # Canada
-    "date_posted": "7days",       # posted in last 7 days
-}
+# Broad roles (NOT remote-only)
+QUERY = (
+    "software engineer OR developer OR full stack OR frontend OR backend OR "
+    "mobile developer OR iOS developer OR Android developer OR "
+    "data engineer OR data analyst OR analytics OR BI analyst OR "
+    "machine learning engineer OR AI engineer OR data scientist OR "
+    "cloud engineer OR cloud architect OR Azure OR AWS OR GCP OR "
+    "devops OR site reliability engineer OR SRE OR platform engineer OR "
+    "cybersecurity OR security analyst OR SOC analyst OR "
+    "network engineer OR systems administrator OR IT support OR IT analyst OR "
+    "QA engineer OR test analyst OR automation tester OR "
+    "product manager OR product owner OR technical product owner OR "
+    "project manager OR program manager OR scrum master OR delivery manager OR "
+    "business analyst OR requirements analyst OR systems analyst OR "
+    "solutions architect OR enterprise architect OR "
+    "implementation specialist OR customer success manager OR "
+    "salesforce administrator OR salesforce developer OR "
+    "accounts receivable OR accounts payable OR AR specialist OR AP specialist OR "
+    "billing specialist OR cash application OR collections OR reconciliation analyst OR "
+    "operations analyst OR process analyst OR process improvement OR "
+    "ERP analyst OR Dynamics 365 OR D365 OR Business Central OR JD Edwards OR SAP OR NetSuite"
+)
 
-headers = {
+API_URL = "https://jsearch.p.rapidapi.com/search"
+HEADERS = {
     "X-RapidAPI-Key": RAPIDAPI_KEY,
     "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
 }
 
-# --------- Fetch Jobs ---------
-try:
-    response = requests.get(url, headers=headers, params=querystring, timeout=30)
-except Exception as e:
-    raise RuntimeError(f"Request failed: {e}")
+# ----------------------------
+# HELPERS
+# ----------------------------
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"seen": []}
+    except Exception:
+        return {"seen": []}
 
-print("HTTP Status:", response.status_code)
+def save_state(state: dict) -> None:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
 
-if response.status_code != 200:
-    print("Response text:", response.text[:1000])
-    raise RuntimeError("RapidAPI request failed.")
+def h(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-data = response.json()
+def slack_post(text: str) -> None:
+    r = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=30)
+    r.raise_for_status()
 
-if "data" not in data:
-    print("Unexpected JSON keys:", list(data.keys()))
-    print("Full response:", str(data)[:1000])
-    raise RuntimeError("RapidAPI response missing 'data' field.")
+def safe_get(d: dict, key: str, default: str = "") -> str:
+    v = d.get(key, default)
+    return v if v is not None else default
 
-jobs = data.get("data", []) or []
+# ----------------------------
+# MAIN
+# ----------------------------
+state = load_state()
+seen = set(state.get("seen", []))
+
+params = {
+    "query": QUERY,
+    "page": "1",
+    "num_pages": str(NUM_PAGES),
+    "country": COUNTRY,
+    "date_posted": DATE_POSTED,
+}
+
+resp = requests.get(API_URL, headers=HEADERS, params=params, timeout=30)
+resp.raise_for_status()
+payload = resp.json()
+
+jobs = payload.get("data", []) or []
 
 if not jobs:
+    slack_post("🟡 Aidrr Jobs Bot: No jobs found in the last 7 days for this search.")
     print("No jobs found.")
-    exit(0)
+    raise SystemExit(0)
 
-# --------- Post Jobs to Slack ---------
 posted = 0
+now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-for job in jobs[:5]:
-    title = job.get("job_title") or "Untitled role"
-    company = job.get("employer_name") or "Unknown company"
-    city = job.get("job_city") or ""
-    province = job.get("job_state") or ""
-    location = f"{city}, {province}".strip(", ")
-    link = job.get("job_apply_link") or job.get("job_google_link") or ""
+for job in jobs:
+    if posted >= MAX_POSTS_PER_RUN:
+        break
 
-    message = f"*{title}*\n{company} — {location}\n{link}".strip()
+    title = safe_get(job, "job_title", "").strip()
+    company = safe_get(job, "employer_name", "").strip()
+    city = safe_get(job, "job_city", "").strip()
+    state_region = safe_get(job, "job_state", "").strip()
+    country = safe_get(job, "job_country", "").strip()
+    location = ", ".join([x for x in [city, state_region, country] if x]) or "Canada"
+    apply_link = safe_get(job, "job_apply_link", "").strip()
+    job_link = safe_get(job, "job_google_link", "").strip()
 
-    slack_payload = {"text": message}
+    link = apply_link or job_link
+    if not link:
+        continue
 
-    slack_res = requests.post(SLACK_WEBHOOK_URL, json=slack_payload, timeout=30)
+    job_id = safe_get(job, "job_id", "").strip()
+    fingerprint = h(f"{job_id}|{title}|{company}|{link}")
 
-    if slack_res.status_code in (200, 204):
-        posted += 1
-    else:
-        print("Slack error:", slack_res.status_code, slack_res.text)
+    if fingerprint in seen:
+        continue
 
-print(f"Jobs posted successfully: {posted}")
+    msg = (
+        f"🔥 *{title}*\n"
+        f"*Company:* {company or 'N/A'}\n"
+        f"*Location:* {location}\n"
+        f"*Link:* {link}\n"
+        f"_Found by Aidrr Jobs Bot • {now}_"
+    )
+
+    slack_post(msg)
+    seen.add(fingerprint)
+    posted += 1
+
+state["seen"] = list(seen)[-2000:]  # keep last 2000 hashes only
+save_state(state)
+
+summary = f"✅ Aidrr Jobs Bot: Posted *{posted}* new job(s)."
+slack_post(summary)
+print(summary)
