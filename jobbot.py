@@ -1,152 +1,149 @@
 import os
-import json
-import hashlib
-from datetime import datetime, timezone
-
+import time
 import requests
 
 # ----------------------------
 # ENV (GitHub Secrets)
 # ----------------------------
-RAPIDAPI_KEY = (os.environ.get("RAPIDAPI_KEY") or "").strip()
-SLACK_WEBHOOK_URL = (os.environ.get("SLACK_WEBHOOK_URL") or "").strip()
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "").strip()
+
+# Accept either secret name (so you never get stuck again)
+SLACK_WEBHOOK_URL = (
+    os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+    or os.environ.get("SLACK_WEBHOOK", "").strip()
+)
 
 if not RAPIDAPI_KEY:
     raise RuntimeError("Missing RAPIDAPI_KEY secret in GitHub Actions.")
 if not SLACK_WEBHOOK_URL:
-    raise RuntimeError("Missing SLACK_WEBHOOK_URL secret in GitHub Actions.")
+    raise RuntimeError("Missing SLACK_WEBHOOK_URL (or SLACK_WEBHOOK) secret in GitHub Actions.")
+
+# ----------------------------
+# RapidAPI JSearch (use the host that worked in your console)
+# If your console shows a different host, replace both lines below.
+# ----------------------------
+API_URL = "https://jsearch27.p.rapidapi.com/search"
+HEADERS = {
+    "X-RapidAPI-Key": RAPIDAPI_KEY,
+    "X-RapidAPI-Host": "jsearch27.p.rapidapi.com",
+}
 
 # ----------------------------
 # SETTINGS
 # ----------------------------
-STATE_FILE = "state.json"          # stores dedupe hashes
-MAX_POSTS_PER_RUN = 15             # how many jobs to post each run
-NUM_PAGES = 2                      # how many pages to fetch from API (increase if you want more)
-DATE_POSTED = "7days"              # last 7 days
-COUNTRY = "ca"                     # Canada
-
-# Broad roles (NOT remote-only)
-QUERY = (
-    "software engineer OR developer OR full stack OR frontend OR backend OR "
-    "mobile developer OR iOS developer OR Android developer OR "
-    "data engineer OR data analyst OR analytics OR BI analyst OR "
-    "machine learning engineer OR AI engineer OR data scientist OR "
-    "cloud engineer OR cloud architect OR Azure OR AWS OR GCP OR "
-    "devops OR site reliability engineer OR SRE OR platform engineer OR "
-    "cybersecurity OR security analyst OR SOC analyst OR "
-    "network engineer OR systems administrator OR IT support OR IT analyst OR "
-    "QA engineer OR test analyst OR automation tester OR "
-    "product manager OR product owner OR technical product owner OR "
-    "project manager OR program manager OR scrum master OR delivery manager OR "
-    "business analyst OR requirements analyst OR systems analyst OR "
-    "solutions architect OR enterprise architect OR "
-    "implementation specialist OR customer success manager OR "
-    "salesforce administrator OR salesforce developer OR "
-    "accounts receivable OR accounts payable OR AR specialist OR AP specialist OR "
-    "billing specialist OR cash application OR collections OR reconciliation analyst OR "
-    "operations analyst OR process analyst OR process improvement OR "
-    "ERP analyst OR Dynamics 365 OR D365 OR Business Central OR JD Edwards OR SAP OR NetSuite"
-)
-
-API_URL = "https://jsearch.p.rapidapi.com/search"
-HEADERS = {
-    "X-RapidAPI-Key": RAPIDAPI_KEY,
-    "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
-}
+DATE_POSTED = "week"      # today | 3days | week | month | all
+PAGES_PER_QUERY = 1       # Keep low to avoid rate limits
+MAX_POSTS_TOTAL = 15      # Total jobs sent to Slack per run
+SLEEP_BETWEEN_CALLS = 1.2 # seconds, helps avoid throttling
 
 # ----------------------------
-# HELPERS
+# ROLES (ALL roles we discussed) — Canada focused, NOT remote-only
+# We split them into small batches so the URL never becomes gigantic.
 # ----------------------------
-def load_state() -> dict:
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {"seen": []}
-    except Exception:
-        return {"seen": []}
+ROLE_GROUPS = [
+    # Core Tech
+    ["software engineer", "full stack developer", "backend developer", "frontend developer", "mobile developer"],
+    ["ios developer", "android developer", "devops engineer", "site reliability engineer", "cloud engineer"],
+    ["data analyst", "business intelligence analyst", "data engineer", "machine learning engineer", "ai engineer"],
+    ["cybersecurity analyst", "security engineer", "network engineer", "systems administrator", "it support specialist"],
+    ["qa engineer", "automation tester", "test analyst", "solutions architect", "enterprise architect"],
 
-def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
+    # Product / Delivery
+    ["business analyst", "requirements analyst", "systems analyst", "technical business analyst", "data business analyst"],
+    ["product owner", "technical product owner", "scrum master", "project manager", "program manager", "delivery manager"],
 
-def h(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    # ERP / Apps
+    ["erp analyst", "dynamics 365", "microsoft dynamics", "sap analyst", "netsuite", "salesforce administrator", "salesforce developer"],
+    ["implementation specialist", "application analyst", "integration analyst", "crm analyst"],
+
+    # Finance / Ops (since you asked earlier too)
+    ["accounts receivable", "accounts payable", "billing specialist", "cash application specialist", "collections specialist", "reconciliation analyst"],
+    ["operations analyst", "process analyst", "process improvement", "business operations"],
+]
 
 def slack_post(text: str) -> None:
-    r = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=30)
+    payload = {"text": text}
+    resp = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=30)
+    resp.raise_for_status()
+
+def build_query(terms):
+    # Canada focus (not remote-only)
+    # You can change "in Canada" to "in Ontario, Canada" if you want tighter results.
+    joined = " OR ".join([f'"{t}"' for t in terms])
+    return f'({joined}) in Canada'
+
+def fetch_jobs(query: str):
+    params = {
+        "query": query,
+        "page": "1",
+        "num_pages": str(PAGES_PER_QUERY),
+        "date_posted": DATE_POSTED,
+        "remote_jobs_only": "false",
+    }
+
+    r = requests.get(API_URL, headers=HEADERS, params=params, timeout=60)
     r.raise_for_status()
+    data = r.json()
+    return data.get("data", []) or []
 
-def safe_get(d: dict, key: str, default: str = "") -> str:
-    v = d.get(key, default)
-    return v if v is not None else default
+def format_job(job: dict) -> str:
+    title = job.get("job_title") or job.get("job_job_title") or "Untitled role"
+    company = job.get("employer_name") or "Unknown company"
+    city = job.get("job_city") or ""
+    state = job.get("job_state") or ""
+    country = job.get("job_country") or ""
+    location = ", ".join([x for x in [city, state, country] if x]).strip() or "Location not listed"
 
-# ----------------------------
-# MAIN
-# ----------------------------
-state = load_state()
-seen = set(state.get("seen", []))
+    link = job.get("job_apply_link") or job.get("job_google_link") or "Link not available"
+    publisher = job.get("job_publisher") or "Source"
+    is_remote = job.get("job_is_remote")
+    remote_tag = "Remote" if is_remote else "On-site/Hybrid"
 
-params = {
-    "query": QUERY,
-    "page": "1",
-    "num_pages": str(NUM_PAGES),
-    "country": COUNTRY,
-    "date_posted": DATE_POSTED,
-}
+    return f"*{title}* | {company}\n{location} • {remote_tag} • {publisher}\n{link}"
 
-resp = requests.get(API_URL, headers=HEADERS, params=params, timeout=30)
-resp.raise_for_status()
-payload = resp.json()
+def main():
+    posted = 0
+    seen_ids = set()
 
-jobs = payload.get("data", []) or []
+    # Header message
+    slack_post(f"🧠 *Aidrr Job Bot* — Canada search (not remote-only) • Date filter: *{DATE_POSTED}*")
 
-if not jobs:
-    slack_post("🟡 Aidrr Jobs Bot: No jobs found in the last 7 days for this search.")
-    print("No jobs found.")
-    raise SystemExit(0)
+    for group in ROLE_GROUPS:
+        if posted >= MAX_POSTS_TOTAL:
+            break
 
-posted = 0
-now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        query = build_query(group)
 
-for job in jobs:
-    if posted >= MAX_POSTS_PER_RUN:
-        break
+        try:
+            jobs = fetch_jobs(query)
+        except Exception as e:
+            slack_post(f"⚠️ Error fetching jobs for query:\n`{query}`\nError: `{e}`")
+            time.sleep(SLEEP_BETWEEN_CALLS)
+            continue
 
-    title = safe_get(job, "job_title", "").strip()
-    company = safe_get(job, "employer_name", "").strip()
-    city = safe_get(job, "job_city", "").strip()
-    state_region = safe_get(job, "job_state", "").strip()
-    country = safe_get(job, "job_country", "").strip()
-    location = ", ".join([x for x in [city, state_region, country] if x]) or "Canada"
-    apply_link = safe_get(job, "job_apply_link", "").strip()
-    job_link = safe_get(job, "job_google_link", "").strip()
+        for job in jobs:
+            if posted >= MAX_POSTS_TOTAL:
+                break
 
-    link = apply_link or job_link
-    if not link:
-        continue
+            job_id = job.get("job_id") or job.get("job_apply_link") or job.get("job_google_link")
+            if not job_id or job_id in seen_ids:
+                continue
+            seen_ids.add(job_id)
 
-    job_id = safe_get(job, "job_id", "").strip()
-    fingerprint = h(f"{job_id}|{title}|{company}|{link}")
+            msg = format_job(job)
+            try:
+                slack_post(msg)
+                posted += 1
+            except Exception as e:
+                slack_post(f"⚠️ Slack post failed: `{e}`")
+                break
 
-    if fingerprint in seen:
-        continue
+        time.sleep(SLEEP_BETWEEN_CALLS)
 
-    msg = (
-        f"🔥 *{title}*\n"
-        f"*Company:* {company or 'N/A'}\n"
-        f"*Location:* {location}\n"
-        f"*Link:* {link}\n"
-        f"_Found by Aidrr Jobs Bot • {now}_"
-    )
+    if posted == 0:
+        slack_post("No jobs found this run. Try changing DATE_POSTED to `month` or increase MAX_POSTS_TOTAL.")
 
-    slack_post(msg)
-    seen.add(fingerprint)
-    posted += 1
+    slack_post(f"✅ Done. Posted *{posted}* jobs.")
 
-state["seen"] = list(seen)[-2000:]  # keep last 2000 hashes only
-save_state(state)
-
-summary = f"✅ Aidrr Jobs Bot: Posted *{posted}* new job(s)."
-slack_post(summary)
-print(summary)
+if __name__ == "__main__":
+    main()
