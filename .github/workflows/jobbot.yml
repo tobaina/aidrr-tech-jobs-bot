@@ -3,7 +3,7 @@ name: Aidrr Tech Jobs Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *" # every 6 hours (UTC)
+    - cron: "0 */12 * * *" # every 12 hours (UTC) to reduce rate limit issues
 
 jobs:
   post_jobs:
@@ -25,8 +25,6 @@ jobs:
       - name: Run job bot
         env:
           RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
-          # We pass BOTH so it works no matter which secret name you keep
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-        run: |
-          python jobbot.py
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python jobbot.py
