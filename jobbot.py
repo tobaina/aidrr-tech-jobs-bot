@@ -2,9 +2,9 @@ import os
 import time
 import requests
 
-# =========================
+# ------------------------
 # ENV (GitHub Secrets)
-# =========================
+# ------------------------
 RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "").strip()
 
 # Accept either secret name so you never get stuck again
@@ -18,176 +18,154 @@ if not RAPIDAPI_KEY:
 if not SLACK_WEBHOOK_URL:
     raise RuntimeError("Missing SLACK_WEBHOOK_URL (or SLACK_WEBHOOK) secret in GitHub Actions.")
 
-# =========================
-# RapidAPI JSearch Settings
-# =========================
+# ------------------------
+# RapidAPI JSearch Endpoint (use the host that works in your RapidAPI console)
+# Your screenshot shows: jsearch27.p.rapidapi.com
+# ------------------------
 API_URL = "https://jsearch27.p.rapidapi.com/search"
 HEADERS = {
     "X-RapidAPI-Key": RAPIDAPI_KEY,
     "X-RapidAPI-Host": "jsearch27.p.rapidapi.com",
 }
 
-DATE_POSTED = os.environ.get("DATE_POSTED", "week")  # allowed: all, today, 3days, week, month
-PAGES_PER_QUERY = int(os.environ.get("PAGES_PER_QUERY", "2"))  # increase if you want more results per role
-
-# =========================
-# ALL TECH ROLES (Canada-only)
-# =========================
-TECH_ROLE_QUERIES = [
+# ------------------------
+# Tech roles (grouped to avoid an overly long URL)
+# NOTE: We force Canada in the query, then we ALSO filter response to job_country == "CA"
+# ------------------------
+ROLE_QUERIES = [
     # Software / Engineering
-    "software engineer in Canada",
-    "senior software engineer in Canada",
-    "full stack developer in Canada",
-    "frontend developer in Canada",
-    "backend developer in Canada",
-    "mobile developer in Canada",
-    "ios developer in Canada",
-    "android developer in Canada",
+    '("software engineer" OR "software developer" OR "senior software engineer" OR "full stack developer" OR "backend developer" OR "frontend developer" OR "mobile developer" OR "ios developer" OR "android developer") in Canada',
 
     # Cloud / DevOps / SRE
-    "devops engineer in Canada",
-    "site reliability engineer in Canada",
-    "cloud engineer in Canada",
-    "cloud architect in Canada",
-    "solutions architect in Canada",
+    '("devops engineer" OR "site reliability engineer" OR "sre" OR "cloud engineer" OR "cloud architect" OR "platform engineer" OR "kubernetes" OR "terraform") in Canada',
 
-    # Data
-    "data analyst in Canada",
-    "business intelligence analyst in Canada",
-    "power bi developer in Canada",
-    "data engineer in Canada",
-    "analytics engineer in Canada",
-    "data scientist in Canada",
-    "machine learning engineer in Canada",
+    # Data / Analytics / ML
+    '("data analyst" OR "business intelligence" OR "bi analyst" OR "analytics engineer" OR "data engineer" OR "machine learning engineer" OR "ml engineer") in Canada',
 
-    # Security / Infrastructure
-    "cybersecurity analyst in Canada",
-    "information security analyst in Canada",
-    "security engineer in Canada",
-    "network engineer in Canada",
-    "systems administrator in Canada",
-    "system analyst in Canada",
-    "IT analyst in Canada",
+    # Cybersecurity
+    '("cybersecurity" OR "security engineer" OR "security analyst" OR "soc analyst" OR "incident response" OR "iam" OR "identity access management") in Canada',
 
-    # Product / Project / Agile
-    "business analyst in Canada",
-    "technical business analyst in Canada",
-    "product manager in Canada",
-    "technical product manager in Canada",
-    "product owner in Canada",
-    "project manager in Canada",
-    "technical project manager in Canada",
-    "scrum master in Canada",
+    # IT / Systems / Network
+    '("systems administrator" OR "system administrator" OR "network engineer" OR "it support" OR "help desk" OR "desktop support" OR "cloud administrator" OR "windows administrator") in Canada',
 
-    # QA / Testing
-    "qa analyst in Canada",
-    "quality assurance engineer in Canada",
-    "automation tester in Canada",
+    # Product / Project / Delivery
+    '("product manager" OR "product owner" OR "technical product owner" OR "project manager" OR "program manager" OR "scrum master" OR "delivery manager") in Canada',
 
-    # Enterprise Applications
-    "salesforce administrator in Canada",
-    "salesforce developer in Canada",
-    "dynamics 365 consultant in Canada",
-    "d365 business analyst in Canada",
-    "sap analyst in Canada",
-    "servicenow developer in Canada",
+    # BA / QA / Implementation
+    '("business analyst" OR "technical analyst" OR "requirements analyst" OR "qa engineer" OR "test analyst" OR "automation tester" OR "implementation specialist" OR "solutions consultant") in Canada',
+
+    # CRM / ERP / Salesforce
+    '("salesforce administrator" OR "salesforce developer" OR "dynamics 365" OR "power platform" OR "crm analyst" OR "erp analyst" OR "implementation consultant") in Canada',
 ]
 
-# =========================
-# Helpers
-# =========================
-def jsearch_request(query: str, page: int = 1, num_pages: int = 1):
+DATE_POSTED = "week"     # options: all, today, 3days, week, month
+NUM_PAGES = 2            # pull more results per query, then filter down
+MAX_POSTS_TOTAL = 25     # cap what you send to Slack each run
+SLEEP_BETWEEN_CALLS = 1.0
+
+
+def slack_post(text: str) -> None:
+    payload = {"text": text}
+    r = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=30)
+    r.raise_for_status()
+
+
+def fetch_jobs(query: str) -> list[dict]:
     params = {
         "query": query,
-        "page": str(page),
-        "num_pages": str(num_pages),
+        "page": "1",
+        "num_pages": str(NUM_PAGES),
         "date_posted": DATE_POSTED,
-        "remote_jobs_only": "false",  # includes on-site/hybrid/remote
+        "remote_jobs_only": "false",
     }
     resp = requests.get(API_URL, headers=HEADERS, params=params, timeout=60)
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    return data.get("data", []) or []
+
+
+def is_canada_job(job: dict) -> bool:
+    # Most reliable field is job_country (typically "CA" for Canada)
+    jc = (job.get("job_country") or "").strip().upper()
+    if jc == "CA":
+        return True
+
+    # Backup checks (sometimes APIs are inconsistent)
+    city = (job.get("job_city") or "").lower()
+    state = (job.get("job_state") or "").lower()
+    title = (job.get("job_title") or "").lower()
+    desc = (job.get("job_description") or "").lower()
+
+    canada_hints = ["canada", "ontario", "toronto", "vancouver", "calgary", "edmonton", "montreal", "ottawa", "waterloo", "kitchener", "gta"]
+    text_blob = " ".join([city, state, title, desc])
+    return any(h in text_blob for h in canada_hints)
+
+
+def job_key(job: dict) -> str:
+    # stable dedupe key
+    return (job.get("job_id") or "") + "|" + (job.get("job_apply_link") or "")
+
 
 def format_job(job: dict) -> str:
-    title = job.get("job_title") or "Unknown title"
-    company = job.get("employer_name") or "Unknown company"
-    city = job.get("job_city") or ""
-    state = job.get("job_state") or ""
-    country = job.get("job_country") or ""
-    location = ", ".join([x for x in [city, state, country] if x]).strip() or "Location not listed"
+    title = (job.get("job_title") or "Untitled").strip()
+    company = (job.get("employer_name") or "Unknown Company").strip()
+    city = (job.get("job_city") or "").strip()
+    state = (job.get("job_state") or "").strip()
+    country = (job.get("job_country") or "").strip()
+    publisher = (job.get("job_publisher") or "").strip()
+    is_remote = job.get("job_is_remote")
 
-    link = job.get("job_apply_link") or job.get("job_google_link") or ""
-    publisher = job.get("job_publisher") or ""
-    remote = job.get("job_is_remote")
+    location_bits = [b for b in [city, state, country] if b]
+    location = ", ".join(location_bits) if location_bits else "Canada (location not listed)"
+    remote_tag = "Remote" if is_remote else "On-site/Hybrid"
 
-    work_mode = "Remote" if remote is True else "On-site/Hybrid"
-    pub_text = f" • {publisher}" if publisher else ""
+    link = (job.get("job_apply_link") or job.get("job_google_link") or "").strip()
+    if not link:
+        link = "Link not provided"
 
-    # Slack-friendly
-    msg = f"*{title}* | {company}\n{location} • {work_mode}{pub_text}\n{link}".strip()
-    return msg
+    return f"*{title}* | {company}\n{location} • {remote_tag} • {publisher}\n{link}"
 
-def post_to_slack(jobs: list):
-    # Canada-only HARD filter
-    canada_jobs = []
-    for job in jobs:
-        jc = (job.get("job_country") or "").upper().strip()
-        if jc not in ("CA", "CANADA"):
-            continue
-        canada_jobs.append(job)
-
-    if not canada_jobs:
-        print("No Canadian jobs found after filtering.")
-        return
-
-    # Slack message size limits → post in chunks
-    messages = [format_job(j) for j in canada_jobs]
-    chunk_size = 25
-
-    total_posted = 0
-    for i in range(0, len(messages), chunk_size):
-        chunk = messages[i:i + chunk_size]
-
-        payload = {
-            "text": "🇨🇦 *Tech Jobs in Canada (Latest)*\n\n" + "\n\n".join(chunk)
-        }
-        r = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=60)
-        r.raise_for_status()
-
-        total_posted += len(chunk)
-        print(f"Posted {len(chunk)} jobs to Slack (running total: {total_posted}).")
-
-        time.sleep(1)
-
-    # final confirmation ping
-    requests.post(SLACK_WEBHOOK_URL, json={"text": f"✅ Done. Posted {total_posted} Canada jobs."}, timeout=60)
 
 def main():
-    all_jobs_by_id = {}
+    all_jobs: list[dict] = []
+    seen = set()
 
-    for q in TECH_ROLE_QUERIES:
+    for q in ROLE_QUERIES:
         try:
-            data = jsearch_request(query=q, page=1, num_pages=PAGES_PER_QUERY)
-            jobs = data.get("data", []) or []
-            print(f"Query: {q} -> {len(jobs)} results (before dedupe/filter)")
-
-            for job in jobs:
-                job_id = job.get("job_id")
-                if not job_id:
-                    continue
-                all_jobs_by_id[job_id] = job
-
-            time.sleep(1)  # be nice to API rate limits
-
-        except requests.HTTPError as e:
-            print(f"HTTP error for query '{q}': {e}")
+            jobs = fetch_jobs(q)
         except Exception as e:
-            print(f"Error for query '{q}': {e}")
+            slack_post(f"⚠️ JSearch error for query:\n`{q}`\nError: {e}")
+            time.sleep(SLEEP_BETWEEN_CALLS)
+            continue
 
-    all_jobs = list(all_jobs_by_id.values())
-    print(f"Total unique jobs pulled: {len(all_jobs)}")
+        for job in jobs:
+            k = job_key(job)
+            if not k or k in seen:
+                continue
+            seen.add(k)
 
-    post_to_slack(all_jobs)
+            if is_canada_job(job):
+                all_jobs.append(job)
+
+        time.sleep(SLEEP_BETWEEN_CALLS)
+
+    # Sort by newest if available
+    def posted_ts(j: dict) -> int:
+        return int(j.get("job_posted_at_timestamp") or 0)
+
+    all_jobs.sort(key=posted_ts, reverse=True)
+
+    if not all_jobs:
+        slack_post("✅ Ran Jobs Bot (Canada-only). No Canada jobs matched today/week for the selected role groups.")
+        return
+
+    # Post top N
+    to_post = all_jobs[:MAX_POSTS_TOTAL]
+    for job in to_post:
+        slack_post(format_job(job))
+
+    slack_post(f"✅ Done. Posted {len(to_post)} Canada jobs (filtered).")
+
 
 if __name__ == "__main__":
     main()
