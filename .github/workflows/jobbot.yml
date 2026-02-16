@@ -1,4 +1,4 @@
-name: Aidrr Tech Jobs Bot
+name: Aidrr Canada BA/Product Jobs Bot
 
 on:
   workflow_dispatch:
@@ -13,6 +13,15 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      # ✅ Cache seen_jobs.json so it persists across runs
+      - name: Restore seen jobs cache
+        uses: actions/cache@v4
+        with:
+          path: seen_jobs.json
+          key: seen-jobs-${{ github.repository }}
+          restore-keys: |
+            seen-jobs-${{ github.repository }}
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -26,12 +35,18 @@ jobs:
         env:
           RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          # Optional tuning:
           PAGES_PER_QUERY: "1"
           DATE_POSTED: "week"
           REMOTE_ONLY: "false"
-          API_CALL_DELAY_SECONDS: "6"
+          API_CALL_DELAY_SECONDS: "8"
           MAX_RETRIES: "3"
-          BACKOFF_BASE_SECONDS: "5"
+          BACKOFF_BASE_SECONDS: "6"
         run: |
           python jobbot.py
+
+      # ✅ Save updated cache
+      - name: Save seen jobs cache
+        uses: actions/cache@v4
+        with:
+          path: seen_jobs.json
+          key: seen-jobs-${{ github.repository }}
