@@ -1,15 +1,15 @@
 import os
-import time
 import json
+import time
 import requests
-from typing import Dict, List, Any, Tuple, Set, Optional
-from urllib.parse import quote_plus
+from typing import List, Dict, Any, Set, Tuple
 
-# ----------------------------
+# =========================
 # ENV (GitHub Secrets)
-# ----------------------------
+# =========================
 RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "").strip()
 
+# Accept either secret name (so you never get stuck again)
 SLACK_WEBHOOK_URL = (
     os.environ.get("SLACK_WEBHOOK_URL", "").strip()
     or os.environ.get("SLACK_WEBHOOK", "").strip()
@@ -20,294 +20,343 @@ if not RAPIDAPI_KEY:
 if not SLACK_WEBHOOK_URL:
     raise RuntimeError("Missing SLACK_WEBHOOK_URL (or SLACK_WEBHOOK) secret in GitHub Actions.")
 
-# ----------------------------
-# RapidAPI JSearch endpoint (your working host)
-# ----------------------------
+# =========================
+# JSearch (RapidAPI) endpoint
+# =========================
 API_URL = "https://jsearch27.p.rapidapi.com/search"
+
 HEADERS = {
     "X-RapidAPI-Key": RAPIDAPI_KEY,
     "X-RapidAPI-Host": "jsearch27.p.rapidapi.com",
 }
 
-# ----------------------------
-# Canada strict detection (STRUCTURED FIELDS ONLY)
-# ----------------------------
-CANADA_PROVINCE_CODES = {
-    "ON", "BC", "AB", "QC", "NS", "NB", "MB", "SK", "NL", "PE", "NT", "NU", "YT"
-}
-
-# City hints only used against job_city (not title)
-CANADA_MAJOR_CITIES = {
-    "toronto", "vancouver", "calgary", "ottawa", "montreal", "montréal",
-    "edmonton", "waterloo", "kitchener", "cambridge", "mississauga",
-    "winnipeg", "halifax", "victoria", "brampton", "hamilton", "london",
-    "markham", "burnaby", "surrey", "quebec", "québec"
-}
-
-# Search anchors (to find Canada jobs)
-CANADA_LOCATION_QUERIES = [
-    "Remote Canada",
-    "Toronto, ON", "Waterloo, ON", "Ottawa, ON", "Mississauga, ON",
-    "Vancouver, BC", "Calgary, AB", "Edmonton, AB",
-    "Montreal, QC", "Halifax, NS", "Winnipeg, MB",
-    "Canada",
-]
-
-# ----------------------------
-# TECH ROLE GROUPS
-# ----------------------------
-ROLE_GROUPS: List[Tuple[str, str]] = [
-    ("Software Engineering",
-     '"software engineer" OR "software developer" OR "senior software engineer" OR "full stack developer" OR "backend developer" OR "frontend developer" OR "mobile developer" OR "ios developer" OR "android developer"'),
-    ("DevOps / Cloud / SRE",
-     '"devops engineer" OR "site reliability engineer" OR "sre" OR "cloud engineer" OR "cloud architect" OR "platform engineer" OR kubernetes OR terraform'),
-    ("Data / Analytics / ML",
-     '"data analyst" OR "business intelligence" OR "bi analyst" OR "analytics engineer" OR "data engineer" OR "machine learning engineer" OR "ml engineer"'),
-    ("Cybersecurity",
-     'cybersecurity OR "security engineer" OR "security analyst" OR "soc analyst" OR "incident response" OR iam OR "identity access management"'),
-    ("Product / Delivery",
-     '"product manager" OR "technical product manager" OR "product owner" OR "technical product owner" OR "project manager" OR "program manager" OR "scrum master" OR "delivery manager"'),
-    ("Business Analysis / QA / Implementation",
-     '"business analyst" OR "technical analyst" OR "requirements analyst" OR "qa engineer" OR "test analyst" OR "automation tester" OR "implementation specialist" OR "solutions consultant"'),
-    ("ERP / CRM (D365 / Salesforce / Power Platform)",
-     '"dynamics 365" OR "power platform" OR "power bi" OR "salesforce administrator" OR "salesforce developer" OR "crm analyst" OR "erp analyst" OR "implementation consultant"'),
-    ("IT Support / Systems / Network",
-     '"systems administrator" OR "system administrator" OR "network engineer" OR "it support" OR "help desk" OR "desktop support"'),
-]
-
-# ----------------------------
-# Posting control
-# ----------------------------
-MAX_JOBS_TO_POST = 25
-DATE_POSTED = "month"          # week is often too tight for CA; month returns more
-REMOTE_ONLY = False
-NUM_PAGES_PER_SEARCH = 1
-SLEEP_BETWEEN_CALLS_SEC = 1.25
+# =========================
+# Settings
+# =========================
 SEEN_FILE = "seen_jobs.json"
 
-# Prefer better links
-MIN_QUALITY_SCORE = 0.70       # reduce junk
-REQUIRE_DIRECT_APPLY = False   # set True if you want only job_apply_is_direct == True
+# Keep this low to avoid rate limits and dead links
+MAX_JOBS_PER_GROUP = 12
+PAGES_PER_QUERY = 1
+RESULTS_PER_PAGE = 20
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def safe_str(x: Any) -> str:
-    return (x or "").strip()
+# Prefer direct apply links (reduces "job not available" frustration)
+ONLY_DIRECT_APPLY = True  # set False if you want everything
 
-def load_seen() -> Set[str]:
-    try:
-        with open(SEEN_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return set(data) if isinstance(data, list) else set()
-    except Exception:
-        return set()
+# Add a small delay between API calls
+API_CALL_DELAY_SECONDS = 2.5
 
-def save_seen(seen: Set[str]) -> None:
-    try:
-        with open(SEEN_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(list(seen))[:5000], f)
-    except Exception:
-        pass
+# =========================
+# Tech role groups (broad)
+# =========================
+TECH_GROUPS: Dict[str, str] = {
+    "Software Engineering": (
+        '("software engineer" OR "software developer" OR "senior software engineer" OR '
+        '"full stack developer" OR "backend developer" OR "frontend developer" OR '
+        '"mobile developer" OR "ios developer" OR "android developer")'
+    ),
+    "DevOps / Cloud / SRE": (
+        '("devops engineer" OR "site reliability engineer" OR "sre" OR '
+        '"cloud engineer" OR "cloud architect" OR "platform engineer" OR '
+        '"kubernetes" OR "terraform")'
+    ),
+    "Data / Analytics / ML": (
+        '("data analyst" OR "business intelligence" OR "bi analyst" OR '
+        '"analytics engineer" OR "data engineer" OR "machine learning engineer" OR "ml engineer")'
+    ),
+    "Cybersecurity": (
+        '("cybersecurity" OR "security engineer" OR "security analyst" OR '
+        '"soc analyst" OR "incident response" OR "iam" OR "identity access management")'
+    ),
+    "QA / Testing": (
+        '("qa engineer" OR "test analyst" OR "automation tester" OR "sdet" OR "quality assurance")'
+    ),
+    "Product / Project / Agile": (
+        '("product manager" OR "product owner" OR "technical product owner" OR '
+        '"project manager" OR "program manager" OR "scrum master" OR "delivery manager")'
+    ),
+    "IT Support / SysAdmin / Network": (
+        '("systems administrator" OR "system administrator" OR "network engineer" OR '
+        '"it support" OR "help desk" OR "desktop support" OR '
+        '"cloud administrator" OR "windows administrator")'
+    ),
+    "ERP / CRM / Implementation": (
+        '("dynamics 365" OR "power platform" OR "crm analyst" OR '
+        '"erp analyst" OR "implementation consultant" OR "solutions consultant" OR '
+        '"salesforce administrator" OR "salesforce developer")'
+    ),
+    "Business Analysis / Technical Analyst": (
+        '("business analyst" OR "technical analyst" OR "requirements analyst" OR '
+        '"implementation specialist" OR "systems analyst")'
+    ),
+}
 
-def slack_post(text: str) -> None:
-    r = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=20)
-    r.raise_for_status()
+# =========================
+# Canada filter helpers
+# =========================
+CANADA_PROVINCES = ["ON", "BC", "AB", "QC", "MB", "NS", "NB", "NL", "SK", "PE", "NT", "NU", "YT"]
 
-def build_queries() -> List[Tuple[str, str]]:
-    queries: List[Tuple[str, str]] = []
-    for group_name, role_query in ROLE_GROUPS:
-        for loc in CANADA_LOCATION_QUERIES:
-            queries.append((group_name, f"({role_query}) {loc}"))
-    return queries
-
-def rapidapi_search(query: str) -> Dict[str, Any]:
-    params = {
-        "query": query,
-        "page": 1,
-        "num_pages": NUM_PAGES_PER_SEARCH,
-        "date_posted": DATE_POSTED,
-        "remote_jobs_only": REMOTE_ONLY,
-    }
-
-    max_tries = 5
-    backoff = 2.0
-
-    for _ in range(max_tries):
-        r = requests.get(API_URL, headers=HEADERS, params=params, timeout=30)
-        if r.status_code == 429:
-            time.sleep(backoff)
-            backoff *= 1.8
-            continue
-        r.raise_for_status()
-        return r.json()
-
-    return {"status": "RATE_LIMITED", "data": []}
-
-def is_canada_job(job: Dict[str, Any]) -> bool:
+def is_canada(job: Dict[str, Any]) -> bool:
     """
-    FINAL strict rule:
-    - Accept only if structured fields indicate Canada.
-    - We DO NOT look at job_title for Canada hints (because query text gets echoed into titles).
+    Strong Canada-only filter.
+    Uses job_country_code first, then job_country, then location string fallback.
     """
-    country = safe_str(job.get("job_country")).upper()
-    state = safe_str(job.get("job_state")).upper()
-    city = safe_str(job.get("job_city")).lower()
+    country = (job.get("job_country") or job.get("country") or "").strip()
+    country_code = (job.get("job_country_code") or job.get("country_code") or "").strip()
 
-    if country == "CA":
+    if country_code.upper() == "CA":
+        return True
+    if country.lower() in ["canada", "ca"]:
         return True
 
-    # Some results omit country but have province code
-    if state in CANADA_PROVINCE_CODES:
-        return True
+    # fallback: location text
+    loc_parts = [
+        str(job.get("job_city", "") or ""),
+        str(job.get("job_state", "") or ""),
+        str(job.get("job_location", "") or ""),
+        str(job.get("job_address", "") or ""),
+    ]
+    loc = " ".join([p for p in loc_parts if p]).strip()
 
-    # City-only hint (only if city itself is clearly Canadian)
-    if city in CANADA_MAJOR_CITIES:
-        return True
+    # Province matches (ON, BC, etc.)
+    for p in CANADA_PROVINCES:
+        if f", {p}" in loc or f" {p}" in loc:
+            return True
 
-    # Remote roles: require country == CA (do not guess)
-    if job.get("job_is_remote") is True and country == "CA":
+    # Also accept "Canada" written inside location
+    if "canada" in loc.lower():
         return True
 
     return False
 
-def quality_ok(job: Dict[str, Any]) -> bool:
-    score_str = safe_str(job.get("job_apply_quality_score"))
-    try:
-        score = float(score_str) if score_str else 0.0
-    except Exception:
-        score = 0.0
 
-    if score and score < MIN_QUALITY_SCORE:
-        return False
-
-    if REQUIRE_DIRECT_APPLY and job.get("job_apply_is_direct") is not True:
-        return False
-
-    return True
-
-def make_google_link(title: str, company: str, city: str, state: str) -> str:
-    q = f'{title} {company} {city} {state} Canada'
-    return "https://www.google.com/search?q=" + quote_plus(q)
-
-def link_is_alive(url: str) -> bool:
+def is_direct_apply(job: Dict[str, Any]) -> bool:
     """
-    Quick, low-cost validation.
-    If it fails, we will post a Google link instead.
+    Prefer direct apply links if available.
+    JSearch typically includes job_apply_is_direct boolean.
     """
-    if not url.startswith("http"):
-        return False
+    val = job.get("job_apply_is_direct")
+    if isinstance(val, bool):
+        return val
+    # sometimes API returns "true"/"false" as string
+    if isinstance(val, str):
+        return val.strip().lower() == "true"
+    return False
 
-    try:
-        # HEAD first
-        r = requests.head(url, timeout=10, allow_redirects=True)
-        if 200 <= r.status_code < 400:
-            return True
-        # Fallback GET (some sites block HEAD)
-        r = requests.get(url, timeout=10, allow_redirects=True)
-        return 200 <= r.status_code < 400
-    except Exception:
-        return False
 
 def pick_best_link(job: Dict[str, Any]) -> str:
-    title = safe_str(job.get("job_job_title")) or safe_str(job.get("job_title")) or "Job"
-    company = safe_str(job.get("employer_name")) or "Company"
-    city = safe_str(job.get("job_city"))
-    state = safe_str(job.get("job_state"))
+    """
+    Choose best link available.
+    Prefer direct apply link if possible, otherwise fallback.
+    """
+    # Common fields in JSearch responses:
+    # job_apply_link, job_google_link, job_offer_expiration_datetime_utc, etc.
+    direct = job.get("job_apply_link") or ""
+    fallback = job.get("job_google_link") or job.get("job_url") or job.get("job_link") or ""
 
-    apply_link = safe_str(job.get("job_apply_link"))
-    google_link = safe_str(job.get("job_google_link")) or make_google_link(title, company, city, state)
+    # If ONLY_DIRECT_APPLY is enabled, use job_apply_link only (when direct)
+    if ONLY_DIRECT_APPLY:
+        return direct.strip()
 
-    # Validate apply link. If dead, use Google link (more stable).
-    if apply_link and link_is_alive(apply_link):
-        return apply_link
-    return google_link
+    # Otherwise prefer apply link then fallback
+    return (direct.strip() or str(fallback).strip())
+
+
+# =========================
+# Seen jobs tracking
+# =========================
+def load_seen() -> Set[str]:
+    if not os.path.exists(SEEN_FILE):
+        return set()
+    try:
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return set(str(x) for x in data)
+        return set()
+    except Exception:
+        return set()
+
+
+def save_seen(seen: Set[str]) -> None:
+    try:
+        with open(SEEN_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(list(seen)), f)
+    except Exception:
+        pass
+
+
+# =========================
+# Slack posting
+# =========================
+def slack_post(text: str) -> None:
+    payload = {"text": text}
+    requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=30)
+
 
 def format_job(job: Dict[str, Any], group_name: str) -> str:
-    title = safe_str(job.get("job_job_title")) or safe_str(job.get("job_title")) or "Job"
-    company = safe_str(job.get("employer_name")) or "Company"
-    city = safe_str(job.get("job_city"))
-    state = safe_str(job.get("job_state"))
-    country = safe_str(job.get("job_country"))
-    is_remote = job.get("job_is_remote")
-    publisher = safe_str(job.get("job_publisher")) or "Source"
+    title = job.get("job_title") or "Untitled role"
+    company = job.get("employer_name") or "Unknown company"
+
+    city = job.get("job_city") or ""
+    state = job.get("job_state") or ""
+    country = job.get("job_country") or "Canada"
+
+    location = ", ".join([x for x in [city, state] if x]).strip()
+    if not location:
+        location = (job.get("job_location") or "").strip()
+
     link = pick_best_link(job)
 
-    loc_bits = [b for b in [city, state, country] if b]
-    loc = ", ".join(loc_bits) if loc_bits else "Location not listed"
-    remote_tag = "Remote" if is_remote else "On-site/Hybrid"
+    # Clean, compact Slack format
+    # Example:
+    # *Software Engineer* — Shopify (Software Engineering)
+    # 📍 Toronto, ON, Canada
+    # 🔗 https://...
+    line1 = f"*{title}* — {company} ({group_name})"
+    line2 = f"📍 {location}, {country}".replace(" ,", "").strip()
+    line3 = f"🔗 {link}" if link else "🔗 Link unavailable"
 
-    return (
-        f"*{group_name}*\n"
-        f"{title} | {company}\n"
-        f"{loc} • {remote_tag} • {publisher}\n"
-        f"{link}\n"
-    )
+    return "\n".join([line1, line2, line3])
 
-def main():
+
+# =========================
+# API fetch with retry
+# =========================
+def fetch_jobs_for_query(query: str) -> Tuple[List[Dict[str, Any]], bool]:
+    """
+    Returns (jobs, rate_limited_flag)
+    """
+    rate_limited = False
+    all_jobs: List[Dict[str, Any]] = []
+
+    for page in range(1, PAGES_PER_QUERY + 1):
+        params = {
+            "query": query,
+            "page": page,
+            "num_pages": 1,
+            "date_posted": "week",
+            "remote_jobs_only": False,
+            "employment_types": "FULLTIME,CONTRACT,PARTTIME,INTERN",
+            "country": "Canada",  # request-level hint; still do strict filter below
+            "language": "en",
+        }
+
+        # Retry with backoff if 429
+        resp = None
+        for attempt in range(4):
+            try:
+                resp = requests.get(API_URL, headers=HEADERS, params=params, timeout=30)
+                if resp.status_code == 429:
+                    rate_limited = True
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                resp.raise_for_status()
+                break
+            except requests.RequestException:
+                if attempt == 3:
+                    return (all_jobs, rate_limited)
+                time.sleep(2 * (attempt + 1))
+
+        if not resp:
+            return (all_jobs, rate_limited)
+
+        data = resp.json()
+        jobs = data.get("data") or []
+        if isinstance(jobs, list):
+            all_jobs.extend(jobs)
+
+        time.sleep(API_CALL_DELAY_SECONDS)
+
+    return (all_jobs, rate_limited)
+
+
+# =========================
+# Main
+# =========================
+def main() -> None:
     seen = load_seen()
+
     posted: List[str] = []
-    rate_limited = 0
-    searches = 0
+    rate_limited_count = 0
+    total_found = 0
+    total_kept = 0
 
-    for group_name, q in build_queries():
-        if len(posted) >= MAX_JOBS_TO_POST:
-            break
+    for group_name, group_query in TECH_GROUPS.items():
+        # Build the query in a way JSearch handles better
+        # Keep it simple and consistent
+        query = f"{group_query} in Canada"
 
-        time.sleep(SLEEP_BETWEEN_CALLS_SEC)
-        searches += 1
+        jobs, rl = fetch_jobs_for_query(query)
+        if rl:
+            rate_limited_count += 1
 
-        data = rapidapi_search(q)
-        if data.get("status") == "RATE_LIMITED":
-            rate_limited += 1
+        if not jobs:
             continue
 
-        jobs = data.get("data") or []
+        # Strict Canada filter
+        jobs = [j for j in jobs if is_canada(j)]
+
+        # Prefer direct apply to reduce "job not available"
+        if ONLY_DIRECT_APPLY:
+            jobs = [j for j in jobs if is_direct_apply(j) and (pick_best_link(j) != "")]
+
+        total_found += len(jobs)
+
+        # De-duplicate within the run + seen file
+        count_group = 0
         for job in jobs:
-            if len(posted) >= MAX_JOBS_TO_POST:
-                break
+            job_id = (
+                str(job.get("job_id") or "")
+                or str(job.get("job_apply_link") or "")
+                or str(job.get("job_google_link") or "")
+            ).strip()
 
-            job_id = safe_str(job.get("job_id"))
-            if not job_id or job_id in seen:
+            if not job_id:
                 continue
-
-            # Hard Canada filter (structured fields only)
-            if not is_canada_job(job):
-                continue
-
-            # Quality filter
-            if not quality_ok(job):
+            if job_id in seen:
                 continue
 
             posted.append(format_job(job, group_name))
             seen.add(job_id)
+            count_group += 1
+            total_kept += 1
+
+            if count_group >= MAX_JOBS_PER_GROUP:
+                break
 
     save_seen(seen)
 
+    # =========================
     # Slack output (clean)
+    # =========================
     if posted:
-        header = f"✅ Aidrr Tech Jobs Bot: Posted {len(posted)} Canada jobs."
-        if rate_limited:
-            header += f" (Rate-limited on {rate_limited} searches; continued.)"
+        header = f"✅ Aidrr Tech Jobs Bot: Posted {len(posted)} Canada tech jobs."
+        if rate_limited_count:
+            header += f" (Rate-limited on {rate_limited_count} searches; auto-retried.)"
         slack_post(header)
 
         # Chunk posts to avoid Slack payload limits
         chunk: List[str] = []
         size = 0
         for item in posted:
-            if size + len(item) > 3300:
-                slack_post("\n".join(chunk))
+            # +2 for separators/newlines
+            if size + len(item) + 2 > 3200:
+                slack_post("\n\n".join(chunk))
                 chunk = []
                 size = 0
             chunk.append(item)
-            size += len(item)
+            size += len(item) + 2
+
         if chunk:
-            slack_post("\n".join(chunk))
+            slack_post("\n\n".join(chunk))
     else:
-        msg = "No Canada tech jobs found in this run."
-        if rate_limited:
-            msg = "No Canada tech jobs found in this run (or API rate-limited this run)."
+        # No noisy error spam — just a clean message
+        msg = "No new Canada tech jobs found in this run."
+        if rate_limited_count:
+            msg += f" (Some searches were rate-limited: {rate_limited_count}. Auto-retry ran.)"
         slack_post(msg)
+
 
 if __name__ == "__main__":
     main()
